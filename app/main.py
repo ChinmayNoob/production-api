@@ -40,6 +40,23 @@ app = FastAPI(
 app.state.limiter = limiter
 
 
+@traceable(name="security_check", run_type="chain")
+def _security_check(message: str) -> tuple[bool, str | None]:
+    return sanitizer.check(message)
+
+
+@traceable(name="sanitize_input", run_type="chain")
+def _sanitize_input(message: str) -> tuple[str, list[str]]:
+    notes: list[str] = []
+    detected = sanitizer.detect_pii(message)
+    if detected:
+        for pii_type, values in detected.items():
+            notes.append(f"Input PII masked: [{pii_type}]")
+        sanitized = sanitizer.redact_pii(message)
+        return sanitized, notes
+    return message, notes
+
+
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
@@ -59,21 +76,23 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("20/minute")
-@traceable(name="chat_endpoint", run_type="server")
+@traceable(name="chat_endpoint", run_type="chain")
 async def chat(request: Request, body: ChatRequest):
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
     thread_id = metrics.record_request(body.thread_id)
 
-    is_safe, reason = sanitizer.check(body.message)
+    is_safe, reason = _security_check(body.message)
     if not is_safe:
         metrics.record_error()
         raise HTTPException(status_code=400, detail=reason)
 
+    sanitized, security_notes = _sanitize_input(body.message)
+
     s = get_settings()
     now = time.time()
-    cached_entry = cache.get(body.message)
+    cached_entry = cache.get(sanitized)
     if cached_entry and (now - cached_entry[2]) < s.cache_ttl_seconds:
         metrics.record_cache_hit()
         return ChatResponse(
@@ -82,12 +101,13 @@ async def chat(request: Request, body: ChatRequest):
             model_used=cached_entry[1],
             cached=True,
             processing_time_ms=0.0,
+            security_notes=security_notes,
         )
 
     metrics.record_cache_miss()
     start = time.perf_counter()
     try:
-        result = agent.invoke(body.message)
+        result = agent.invoke(sanitized)
         elapsed_ms = (time.perf_counter() - start) * 1000
         metrics.record_latency(elapsed_ms / 1000)
 
@@ -95,13 +115,14 @@ async def chat(request: Request, body: ChatRequest):
             metrics.record_error()
             raise HTTPException(status_code=502, detail=result["error"])
 
-        cache[body.message] = (result["response"], result["model_used"], now)
+        cache[sanitized] = (result["response"], result["model_used"], now)
 
         return ChatResponse(
             response=result["response"],
             thread_id=thread_id,
             model_used=result["model_used"],
             processing_time_ms=round(elapsed_ms, 2),
+            security_notes=security_notes,
         )
     except HTTPException:
         raise
