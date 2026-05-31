@@ -7,6 +7,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
+from langsmith import traceable
 
 from app.config import get_settings
 from app.models import ChatRequest, ChatResponse, HealthResponse, MetricsResponse
@@ -58,6 +59,7 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("20/minute")
+@traceable(name="chat_endpoint", run_type="server")
 async def chat(request: Request, body: ChatRequest):
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
