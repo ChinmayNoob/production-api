@@ -20,6 +20,7 @@ limiter = Limiter(key_func=get_remote_address)
 metrics = MetricsCollector()
 sanitizer = InputSanitizer()
 agent: ProductionAgent | None = None
+cache: dict[str, tuple[str, str, float]] = {}
 
 
 @asynccontextmanager
@@ -68,6 +69,20 @@ async def chat(request: Request, body: ChatRequest):
         metrics.record_error()
         raise HTTPException(status_code=400, detail=reason)
 
+    s = get_settings()
+    now = time.time()
+    cached_entry = cache.get(body.message)
+    if cached_entry and (now - cached_entry[2]) < s.cache_ttl_seconds:
+        metrics.record_cache_hit()
+        return ChatResponse(
+            response=cached_entry[0],
+            thread_id=thread_id,
+            model_used=cached_entry[1],
+            cached=True,
+            processing_time_ms=0.0,
+        )
+
+    metrics.record_cache_miss()
     start = time.perf_counter()
     try:
         result = agent.invoke(body.message)
@@ -77,6 +92,8 @@ async def chat(request: Request, body: ChatRequest):
         if result["error"]:
             metrics.record_error()
             raise HTTPException(status_code=502, detail=result["error"])
+
+        cache[body.message] = (result["response"], result["model_used"], now)
 
         return ChatResponse(
             response=result["response"],

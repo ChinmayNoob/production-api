@@ -1,5 +1,5 @@
 import time
-from cache import ResponseCache
+from app.cache import ResponseCache
 
 class LLMOptimizer:
     """Optimizes LLM API calls using intelligent caching"""
